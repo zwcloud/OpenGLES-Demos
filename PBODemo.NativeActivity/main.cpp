@@ -32,7 +32,7 @@ struct engine {
 	int32_t height;
 	struct saved_state state;
 
-	std::unique_ptr<SimpleRenderer> mCubeRenderer;
+	std::unique_ptr<SimpleRenderer> mRenderer;
 };
 
 /**
@@ -103,10 +103,10 @@ static int engine_init_display(struct engine* engine) {
 	engine->height = h;
 	engine->state.angle = 0;
 
-	if (!engine->mCubeRenderer)
+	if (!engine->mRenderer)
 	{
-		engine->mCubeRenderer.reset(new SimpleRenderer());
-		engine->mCubeRenderer->UpdateWindowSize(w, h);
+		engine->mRenderer.reset(new SimpleRenderer());
+		engine->mRenderer->UpdateWindowSize(w, h);
 	}
 
 	return 0;
@@ -121,7 +121,7 @@ static void engine_draw_frame(struct engine* engine) {
 		return;
 	}
 
-	engine->mCubeRenderer->Draw();
+	engine->mRenderer->Draw();
 
 	eglSwapBuffers(engine->display, engine->surface);
 }

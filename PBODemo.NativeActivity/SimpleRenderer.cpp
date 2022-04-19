@@ -1,21 +1,65 @@
-//
-// This file is used by the template to render a basic scene using GL.
-//
 #include "pch.h"
-
 #include "SimpleRenderer.h"
-
-// These are used by the shader compilation methods.
-#include <vector>
 #include <iostream>
-#include <stdexcept>
-#include <cassert>
+#include <sys/time.h>
+#include <algorithm>
 
 #define LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, "PBODemo.NativeActivity", __VA_ARGS__))
-
 #define err(content) ((void)__android_log_print(ANDROID_LOG_ERROR, "PBODemo.NativeActivity", "%s(%d): error: %s", __FILE__ , __LINE__ , content))
-#define check(value, content) if(value == 0) {err(content);}
 
+void fnCheckGLError(const char* szFile, int nLine)
+{
+    GLenum ErrCode = glGetError();
+    if (GL_NO_ERROR != ErrCode)
+    {
+        const char* szErr = "UNKNOWN ERROR";
+        switch (ErrCode)
+        {
+			case GL_INVALID_ENUM: szErr = "GL_INVALID_ENUM"; break;
+			case GL_INVALID_VALUE: szErr = "GL_INVALID_VALUE"; break;
+			case GL_INVALID_OPERATION: szErr = "GL_INVALID_OPERATION"; break;
+			case GL_OUT_OF_MEMORY: szErr = "GL_OUT_OF_MEMORY"; break;
+			case GL_INVALID_FRAMEBUFFER_OPERATION: szErr = "GL_INVALID_FRAMEBUFFER_OPERATION"; break;
+        }
+        __android_log_print(ANDROID_LOG_ERROR, "PBODemo.NativeActivity", "%s(%d):glError %s\n", szFile, nLine, szErr);
+    }
+}
+#define _CheckGLError_ fnCheckGLError(__FILE__,__LINE__);
+
+//https://gist.github.com/diabloneo/9619917
+void timespec_diff(struct timespec *start, struct timespec *stop,
+                   struct timespec *result)
+{
+    if ((stop->tv_nsec - start->tv_nsec) < 0) {
+        result->tv_sec = stop->tv_sec - start->tv_sec - 1;
+        result->tv_nsec = stop->tv_nsec - start->tv_nsec + 1000000000;
+    } else {
+        result->tv_sec = stop->tv_sec - start->tv_sec;
+        result->tv_nsec = stop->tv_nsec - start->tv_nsec;
+    }
+
+    return;
+}
+
+//https://stackoverflow.com/a/32334103/3427520
+bool nearly_equal(
+  float a, float b,
+  float epsilon = 128 * FLT_EPSILON, float abs_th = FLT_MIN)
+  // those defaults are arbitrary and could be removed
+{
+  assert(std::numeric_limits<float>::epsilon() <= epsilon);
+  assert(epsilon < 1.f);
+
+  if (a == b) return true;
+
+  auto diff = std::abs(a-b);
+  auto norm = std::min(float(fabs(a) + fabs(b)), std::numeric_limits<float>::max());
+  // or even faster: std::min(std::abs(a + b), std::numeric_limits<float>::max());
+  // keeping this commented out until I update figures below
+  return diff < std::max(abs_th, epsilon * norm);
+}
+
+//not used, put in Draw() 
 class FScopePerformanceCounter
 {
 public:
@@ -24,6 +68,7 @@ public:
 		if(clock_gettime(CLOCK_MONOTONIC_RAW, &Start) < 0)
 		{
 			err("clock_gettime failed");
+			abort();
 		}
 	}
 
@@ -32,6 +77,7 @@ public:
 		if(clock_gettime(CLOCK_MONOTONIC_RAW, &End) < 0)
 		{
 			err("clock_gettime failed");
+			abort();
 		}
 
 		long nanoseconds = End.tv_nsec - Start.tv_nsec;
@@ -52,8 +98,40 @@ struct FOpenGLContext
 	GLuint FBO = 0;
 	GLuint PBO = 0;
 	GLuint FBOTexture = 0;
-	int FBO_width = 2048;
-	int FBO_height = 1024;
+	int FBO_width = 128;
+	int FBO_height = 128;
+
+#define RGBA8Byte 1
+#define RGBAHalf 2
+#define RGBAFloat 3
+
+#define FORMAT RGBAFloat
+	//See Engine\Source\Runtime\OpenGLDrv\Private\OpenGLDevice.cpp in PLATFORM_ANDROID
+	//See https://www.khronos.org/registry/OpenGL-Refpages/es3.0/html/glTexImage2D.xhtml
+#if FORMAT == RGBA8Byte
+	//PF_B8G8R8A8 RTF_RGBA8
+	GLenum internalFormat = GL_RGBA;
+	GLenum format = GL_RGBA;
+	GLenum pixelDataType = GL_UNSIGNED_BYTE;
+	int pixelByteSize = 4;// sizeof(uint8_t) * 4
+#elif FORMAT == RGBAHalf
+	//PF_FloatRGBA RTF_RGBA16f
+	GLenum internalFormat = GL_RGBA16F;
+	GLenum format = GL_RGBA;
+	GLenum pixelDataType = GL_HALF_FLOAT;
+	int pixelByteSize = 8;// sizeof(half) * 4, sizeof(half) = 16bit = 2byte
+#elif FORMAT == RGBAFloat
+	//PF_A32B32G32R32F RTF_RGBA32f
+	GLenum internalFormat = GL_RGBA32F;
+	GLenum format = GL_RGBA;
+	GLenum pixelDataType = GL_FLOAT;
+	int pixelByteSize = 16;// sizeof(float) * 4, sizeof(float) = 32bit = 4byte
+#else
+# error Unknown format
+#endif
+
+	int pixelNum = FBO_width * FBO_height;
+	GLsizeiptr pixelDataSize = pixelNum * pixelByteSize;
 };
 
 FOpenGLContext GOpenGLContext;
@@ -81,10 +159,6 @@ void CheckExtensions()
     }
 }
 
-GLuint PersisentSrcBuffer;
-GLuint PersisentTargetBuffer;
-GLuint PersisentBufferSize = 128*128;
-
 SimpleRenderer::SimpleRenderer() :
     mWindowWidth(0),
     mWindowHeight(0),
@@ -92,115 +166,217 @@ SimpleRenderer::SimpleRenderer() :
 {
     CheckExtensions();
     
+	//create FBO
 	glGenFramebuffers(1, &GOpenGLContext.FBO);
 	glBindFramebuffer(GL_FRAMEBUFFER, GOpenGLContext.FBO);
 
 	glGenTextures(1, &GOpenGLContext.FBOTexture);
 	glBindTexture(GL_TEXTURE_2D, GOpenGLContext.FBOTexture);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, GOpenGLContext.FBO_width, GOpenGLContext.FBO_height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+	glTexImage2D(GL_TEXTURE_2D, 0,
+		GOpenGLContext.internalFormat, 
+		GOpenGLContext.FBO_width, GOpenGLContext.FBO_height,
+		0,
+		GOpenGLContext.format, GOpenGLContext.pixelDataType, nullptr);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, GOpenGLContext.FBOTexture, 0);
-
-	glGenBuffers(1, &GOpenGLContext.PBO);
-	glBindBuffer(GL_PIXEL_PACK_BUFFER, GOpenGLContext.PBO);
-	glBufferData(GL_PIXEL_PACK_BUFFER, GOpenGLContext.FBO_width * GOpenGLContext.FBO_height * 3, nullptr, GL_STATIC_READ);
-	glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+		GOpenGLContext.FBOTexture, 0);
 
 	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
 	{
 		err("framebuffer is not complete");
+		abort();
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-}
 
-void testCopyBuffer()
-{
-	glGenBuffers(1, &PersisentSrcBuffer);
-	glBindBuffer(GL_COPY_READ_BUFFER, PersisentSrcBuffer);
-	glBufferData(GL_COPY_READ_BUFFER, PersisentBufferSize, NULL, GL_STATIC_COPY);
-	GLenum err = glGetError();
-	unsigned char* ptr = (unsigned char*)glMapBufferRange(GL_COPY_READ_BUFFER, 0, PersisentBufferSize, GL_MAP_WRITE_BIT);
-	
-	for (int Index = 0; Index < PersisentBufferSize; Index++)
-	{
-		ptr[Index] = Index%255;
-	}
-	glUnmapBuffer(GL_COPY_READ_BUFFER);
-
-	glGenBuffers(1, &PersisentTargetBuffer);
-	glBindBuffer(GL_COPY_READ_BUFFER, PersisentSrcBuffer);
-	glBindBuffer(GL_COPY_WRITE_BUFFER, PersisentTargetBuffer);
-	glBufferData(GL_COPY_WRITE_BUFFER, PersisentBufferSize, NULL, GL_STATIC_DRAW);
-	glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, PersisentBufferSize);
-	glBindBuffer(GL_COPY_WRITE_BUFFER, PersisentTargetBuffer);
-	glBindBuffer(GL_COPY_READ_BUFFER, PersisentTargetBuffer);
-
-	glBindBuffer(GL_COPY_WRITE_BUFFER, PersisentTargetBuffer);
-	unsigned char* targetPtr = (unsigned char*)glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, PersisentBufferSize, GL_MAP_READ_BIT);
-	for (int Index = 0; Index < PersisentBufferSize; Index++)
-	{
-		check((targetPtr[Index] == ptr[Index]), "");
-	}
-	glUnmapBuffer(GL_COPY_WRITE_BUFFER);
-	glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
+	//create PBO
+	glGenBuffers(1, &GOpenGLContext.PBO);
+	glBindBuffer(GL_PIXEL_PACK_BUFFER, GOpenGLContext.PBO);
+	glBufferData(GL_PIXEL_PACK_BUFFER, GOpenGLContext.pixelDataSize, nullptr, GL_STATIC_READ);
+	glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 }
 
 SimpleRenderer::~SimpleRenderer()
 {
+	glDeleteBuffers(1, &GOpenGLContext.PBO);
+	glDeleteTextures(1, &GOpenGLContext.FBOTexture);
 	glDeleteFramebuffers(1, &GOpenGLContext.FBO);
 }
 
-void test()
+#pragma region Readback FBO via PBO
+bool requestPending = false;
+GLsync readbackFence = 0;
+unsigned char R = 125;
+unsigned char G = 26;
+unsigned char B = 78;
+unsigned char A = 255;
+
+void RequestReadback()
 {
-	//testCopyBuffer();
-}
-
-void SimpleRenderer::Draw()
-{
-	FScopePerformanceCounter FreqScope;
-
-	static unsigned char R = 125;
-	static unsigned char G = 26;
-	static unsigned char B = 78;
-
-	R++;
-	G++;
-	B++;
-
+	//fill FBO with a new random color
+	R = rand()%255;
+	G = rand()%255;
+	B = rand()%255;
+	
 	glBindFramebuffer(GL_FRAMEBUFFER, GOpenGLContext.FBO);
 	glClearColor(R/255.0f, G/255.0f, B/255.0f, 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
 
+	//request readback via glReadPixels on PBO
 	glBindBuffer(GL_PIXEL_PACK_BUFFER, GOpenGLContext.PBO);
-	glReadPixels(0, 0, GOpenGLContext.FBO_width, GOpenGLContext.FBO_height, GL_RGB, GL_UNSIGNED_BYTE, 0);
+	_CheckGLError_
+	glReadPixels(0, 0, GOpenGLContext.FBO_width, GOpenGLContext.FBO_height,
+		GOpenGLContext.format, GOpenGLContext.pixelDataType, 0);
+	_CheckGLError_
 	//glReadPixels returns immediately
 	glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+	
+	_CheckGLError_
+	//create fence, which will be signaled when glReadPixels finished in GPU
+	readbackFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+	_CheckGLError_
+	if(readbackFence == 0)
+	{
+		err("glFenceSync failed");
+		abort();
+	}
+	
+	timespec timeNow;
+	clock_gettime(CLOCK_MONOTONIC_RAW, &timeNow);
+	LOGI("Request readback at %lds %.3fms", timeNow.tv_sec, timeNow.tv_nsec / 1000000.0);
+
+	requestPending = true;
+}
+
+//check if glReadPixels on PBO completed
+bool IsReadbackReady()
+{
+	if(!requestPending) err("No request is pending!");
+
+	GLint result;
+	glGetSynciv(readbackFence, GL_SYNC_STATUS, sizeof(result), nullptr, &result);
+	_CheckGLError_
+	bool isReady = result == GL_SIGNALED;
+	if(isReady)
+	{
+		timespec timeNow;
+		clock_gettime(CLOCK_MONOTONIC_RAW, &timeNow);
+		LOGI("Readback is ready at %lds %.3fms", timeNow.tv_sec, timeNow.tv_nsec / 1000000.0);
+	}
+	return isReady;
+}
+
+void Readback()
+{
+	if(!requestPending)
+	{
+		err("No request is pending!");
+	}
+	
+	timespec start;
+	clock_gettime(CLOCK_MONOTONIC_RAW, &start);
 
 	glBindBuffer(GL_PIXEL_PACK_BUFFER, GOpenGLContext.PBO);
-	check(glGetError() == GL_NO_ERROR, "Bind buffer error");
-
-	unsigned char* pixelsData = (unsigned char*)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, PersisentBufferSize, GL_MAP_READ_BIT);
-	GLenum error = glGetError();
-	int pixelNum = GOpenGLContext.FBO_width * GOpenGLContext.FBO_height;
-	for (int i = 0; i < pixelNum; i++)
+	_CheckGLError_
+		
+#if FORMAT == RGBA8Byte
+	unsigned char* pixelsData = (unsigned char*)
+#elif FORMAT == RGBAHalf
+#error not implemented
+#elif FORMAT == RGBAFloat
+	float* pixelsData = (float*)
+#else
+# error Unknown format
+#endif
+		glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GOpenGLContext.pixelDataSize,
+			GL_MAP_READ_BIT);
+	if(pixelsData == nullptr)
 	{
-		int startIdx = 3 * i;
-		if ((pixelsData[startIdx] != R) || (pixelsData[startIdx + 1] != G) || (pixelsData[startIdx + 2] != B))
+		err("glMapBufferRange failed");
+		abort();
+	}
+	_CheckGLError_
+
+#if FORMAT == RGBA8Byte
+	for (int i = 0; i < GOpenGLContext.pixelNum; i++)
+	{
+		int startIdx = 4 * i;
+		if ((pixelsData[startIdx] != R)
+			|| (pixelsData[startIdx + 1] != G)
+			|| (pixelsData[startIdx + 2] != B)
+			|| (pixelsData[startIdx + 3] != A))
 		{
 			err("Value is mismatch");
-			break;
+			abort();
 		}
 	}
+#elif FORMAT == RGBAHalf
+#error not implemented
+#elif FORMAT == RGBAFloat
+	for (int i = 0; i < GOpenGLContext.pixelNum; i++)
+	{
+		int startIdx = 4 * i;
+		if ( !nearly_equal(pixelsData[startIdx], R/255.0f)
+			|| !nearly_equal(pixelsData[startIdx + 1], G/255.0f)
+			|| !nearly_equal(pixelsData[startIdx + 2], B/255.0f)
+			|| !nearly_equal(pixelsData[startIdx + 3], A/255.0f))
+		{
+			err("Value is mismatch");
+			abort();
+		}
+	}
+#else
+# error Unknown format
+#endif
 	glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
 	glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+	
+	timespec end;
+	clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+	
+	timespec usedTime;
+	timespec_diff(&start, &end, &usedTime);
+	LOGI("Readback finished in %lds %.3fms", usedTime.tv_sec, usedTime.tv_nsec / 1000000.0);
 
+	//no longer needed since the fence has already been signaled
+	glDeleteSync(readbackFence);
+	readbackFence = 0;
+
+	requestPending = false;
+}
+#pragma endregion
+
+timespec timeLastRequestFinished;
+const int RequestIntervalSeconds = 3;
+
+void SimpleRenderer::Draw()
+{
+	//Remove comment of next line to log frame time and fps.
+	//FScopePerformanceCounter FreqScope;
+
+	if(!requestPending)
+	{
+		timespec timeNow;
+		clock_gettime(CLOCK_MONOTONIC_RAW, &timeNow);
+		if(timeNow.tv_sec - timeLastRequestFinished.tv_sec > RequestIntervalSeconds)
+		{
+			RequestReadback();
+		}
+	}
+	else
+	{
+		if(IsReadbackReady())
+		{
+			Readback();
+			clock_gettime(CLOCK_MONOTONIC_RAW, &timeLastRequestFinished);
+		}
+	}
+
+	//display being requested framebuffer color
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	glClearColor(0.2f, 0.3f, 0.6f, 1.0f);
+	glClearColor(R/255.0f, G/255.0f, B/255.0f, 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
-
-	test();
 
     mDrawCount += 1;
 }
